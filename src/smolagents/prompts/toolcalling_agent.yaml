@@ -94,6 +94,16 @@ system_prompt: |-
   - {{ tool.to_tool_calling_prompt() }}
   {%- endfor %}
 
+  {%- if skills and skills.values() | list %}
+  You also have access to Skills.
+  A Skill is a reusable instruction package for a specific type of task.
+  If a listed skill matches the current task, activate that skill, load extra resources only when needed, and follow the skill guidance in your next steps.
+  Available skills:
+  {%- for skill in skills.values() %}
+  - {{ skill.name }}: {{ skill.description }}
+  {%- endfor %}
+  {%- endif %}
+
   {%- if managed_agents and managed_agents.values() | list %}
   You can also give tasks to team members.
   Calling a team member works similarly to calling a tool: provide the task description as the 'task' argument. Since this team member is a real human, be as detailed and verbose as necessary in your task description.

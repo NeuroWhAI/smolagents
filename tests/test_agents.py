@@ -68,6 +68,7 @@ from smolagents.models import (
     TransformersModel,
 )
 from smolagents.monitoring import AgentLogger, LogLevel, Timing, TokenUsage
+from smolagents.skills import Skill
 from smolagents.tools import Tool, tool
 from smolagents.utils import (
     BASE_BUILTIN_MODULES,
@@ -103,6 +104,22 @@ class ChoiceDelta:
 def get_new_path(suffix="") -> str:
     directory = tempfile.mkdtemp()
     return os.path.join(directory, str(uuid.uuid4()) + suffix)
+
+
+def create_skill(base_dir: Path, name: str = "sample_skill") -> Skill:
+    skill_dir = base_dir / name
+    skill_dir.mkdir(parents=True, exist_ok=True)
+    (skill_dir / "SKILL.md").write_text(
+        f"""---
+name: {name}
+description: {name} description
+---
+Follow the recipe from this skill.
+""",
+        encoding="utf-8",
+    )
+    (skill_dir / "notes.txt").write_text("resource contents", encoding="utf-8")
+    return Skill.from_folder(skill_dir)
 
 
 @pytest.fixture
@@ -283,6 +300,54 @@ result = 2**3.6452
                 content="llm plan again",
                 token_usage=TokenUsage(input_tokens=10, output_tokens=10),
             )
+
+
+class FakeToolCallModelSkill(Model):
+    def generate(self, messages, tools_to_call_from=None, stop_sequences=None):
+        if len(messages) < 3:
+            return ChatMessage(
+                role=MessageRole.ASSISTANT,
+                content="I will activate a skill.",
+                tool_calls=[
+                    ChatMessageToolCall(
+                        id="call_0",
+                        type="function",
+                        function=ChatMessageToolCallFunction(
+                            name="activate_skill", arguments={"name": "sample_skill"}
+                        ),
+                    )
+                ],
+            )
+        return ChatMessage(
+            role=MessageRole.ASSISTANT,
+            content="I will return the final answer.",
+            tool_calls=[
+                ChatMessageToolCall(
+                    id="call_1",
+                    type="function",
+                    function=ChatMessageToolCallFunction(name="final_answer", arguments={"answer": "done"}),
+                )
+            ],
+        )
+
+
+class FakeCodeModelSkill(Model):
+    def generate(self, messages, stop_sequences=None):
+        return ChatMessage(
+            role=MessageRole.ASSISTANT,
+            content="""
+Thought: I will load the skill and one resource before returning.
+<code>
+skill_payload = activate_skill(name="sample_skill")
+resource_payload = read_skill_resource(name="sample_skill", path="notes.txt")
+assert skill_payload["ok"] is True
+assert "Follow the recipe" in skill_payload["body"]
+assert resource_payload["ok"] is True
+assert resource_payload["content"] == "resource contents"
+final_answer("done")
+</code>
+""",
+        )
 
 
 class FakeCodeModelError(Model):
@@ -534,6 +599,41 @@ class TestAgent:
         agent.run("Empty task")
         for module in BASE_BUILTIN_MODULES:
             assert module in agent.system_prompt
+
+    def test_skills_are_conditionally_included_in_system_prompt(self, tmp_path):
+        agent_without_skills = CodeAgent(tools=[], model=FakeCodeModel(), skills=[])
+        assert "You also have access to Skills." not in agent_without_skills.system_prompt
+
+        skill = create_skill(tmp_path)
+        agent_with_skills = CodeAgent(tools=[], model=FakeCodeModel(), skills=[skill])
+        assert "You also have access to Skills." in agent_with_skills.system_prompt
+        assert "If a listed skill matches the current task, activate that skill" in agent_with_skills.system_prompt
+        assert "sample_skill: sample_skill description" in agent_with_skills.system_prompt
+
+    def test_skills_auto_add_skill_tools(self, tmp_path):
+        skill = create_skill(tmp_path)
+        code_agent = CodeAgent(tools=[], model=FakeCodeModel(), skills=[skill])
+        toolcalling_agent = ToolCallingAgent(tools=[], model=FakeToolCallModel(), skills=[skill])
+
+        assert "activate_skill" in code_agent.tools
+        assert "read_skill_resource" in code_agent.tools
+        assert "activate_skill" in toolcalling_agent.tools
+        assert "read_skill_resource" in toolcalling_agent.tools
+
+    def test_toolcalling_agent_can_activate_skill(self, tmp_path):
+        skill = create_skill(tmp_path)
+        agent = ToolCallingAgent(tools=[], model=FakeToolCallModelSkill(), skills=[skill])
+
+        output = agent.run("Use a skill")
+        assert output == "done"
+        assert "Follow the recipe from this skill." in agent.memory.steps[1].observations
+
+    def test_code_agent_can_read_skill_resource(self, tmp_path):
+        skill = create_skill(tmp_path)
+        agent = CodeAgent(tools=[], model=FakeCodeModelSkill(), skills=[skill])
+
+        output = agent.run("Use a skill resource")
+        assert output == "done"
 
     def test_init_agent_with_different_toolsets(self):
         toolset_1 = []
@@ -2278,6 +2378,27 @@ print("Ok, calculation done!")""")
         assert agent.model.model_id == "Qwen/Qwen2.5-Coder-32B-Instruct"
         assert agent.logger.level == 2
         assert agent.prompt_templates["system_prompt"] == "dummy system prompt"
+
+    def test_save_with_skills_raises(self, tmp_path):
+        skill = create_skill(tmp_path / "skill_source")
+        model = InferenceClientModel(model_id="Qwen/Qwen2.5-Coder-32B-Instruct")
+        agent = CodeAgent(model=model, tools=[], skills=[skill])
+
+        export_dir = tmp_path / "saved_agent"
+        with pytest.raises(ValueError, match="Saving agents with skills is not supported yet."):
+            agent.save(export_dir)
+
+    def test_read_skill_resource_returns_payload_for_binary_file(self, tmp_path):
+        skill_dir = tmp_path / "skill_source" / "sample_skill"
+        skill = create_skill(tmp_path / "skill_source")
+        (skill_dir / "binary.bin").write_bytes(b"\x80\x81\x82\x83")
+        # Reload skill so resources index contains the binary file.
+        skill = Skill.from_folder(skill_dir)
+        agent = CodeAgent(model=FakeCodeModel(), tools=[], skills=[skill])
+
+        output = agent.tools["read_skill_resource"](name="sample_skill", path="binary.bin")
+        assert output["ok"] is False
+        assert output["error_code"] == "RESOURCE_READ_ERROR"
 
     def test_from_dict(self):
         # Create a test agent dictionary

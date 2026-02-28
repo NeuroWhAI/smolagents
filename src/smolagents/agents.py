@@ -78,6 +78,8 @@ from .monitoring import (
     TokenUsage,
 )
 from .remote_executors import BlaxelExecutor, DockerExecutor, E2BExecutor, ModalExecutor, WasmExecutor
+from .skill_tools import ActivateSkillTool, ReadSkillResourceTool
+from .skills import Skill
 from .tools import BaseTool, Tool, validate_tool_arguments
 from .utils import (
     AgentError,
@@ -279,6 +281,7 @@ class MultiStepAgent(ABC):
         add_base_tools (`bool`, default `False`): Whether to add the base tools to the agent's tools.
         verbosity_level (`LogLevel`, default `LogLevel.INFO`): Level of verbosity of the agent's logs.
         managed_agents (`list`, *optional*): Managed agents that the agent can call.
+        skills (`list[Skill]`, *optional*): Skills that the agent can use.
         step_callbacks (`list[Callable]` | `dict[Type[MemoryStep], Callable | list[Callable]]`, *optional*): Callbacks that will be called at each step.
         planning_interval (`int`, *optional*): Interval at which the agent will run a planning step.
         name (`str`, *optional*): Necessary for a managed agent only - the name by which this agent can be called.
@@ -301,6 +304,7 @@ class MultiStepAgent(ABC):
         add_base_tools: bool = False,
         verbosity_level: LogLevel = LogLevel.INFO,
         managed_agents: list | None = None,
+        skills: list[Skill] | None = None,
         step_callbacks: list[Callable] | dict[Type[MemoryStep], Callable | list[Callable]] | None = None,
         planning_interval: int | None = None,
         name: str | None = None,
@@ -337,7 +341,8 @@ class MultiStepAgent(ABC):
         self.instructions = instructions
         self._setup_managed_agents(managed_agents)
         self._setup_tools(tools, add_base_tools)
-        self._validate_tools_and_managed_agents(tools, managed_agents)
+        self._setup_skills(skills)
+        self._validate_tools_and_managed_agents(tools, managed_agents, skills)
 
         self.task: str | None = None
         self.memory = AgentMemory(self.system_prompt)
@@ -401,8 +406,35 @@ class MultiStepAgent(ABC):
             )
         self.tools.setdefault("final_answer", FinalAnswerTool())
 
-    def _validate_tools_and_managed_agents(self, tools, managed_agents):
+    def _setup_skills(self, skills: list[Skill] | None) -> None:
+        self.skills: dict[str, Skill] = {}
+        if not skills:
+            return
+
+        for skill in skills:
+            if not isinstance(skill, Skill):
+                raise TypeError("All elements in 'skills' must be instances of Skill.")
+            if skill.name in self.skills:
+                raise ValueError(f"Duplicate skill name found: '{skill.name}'. Skill names must be unique.")
+            self.skills[skill.name] = skill
+
+        reserved_skill_tool_names = ["activate_skill", "read_skill_resource"]
+        conflicting_names = [
+            name for name in reserved_skill_tool_names if name in self.tools or name in self.managed_agents
+        ]
+        if conflicting_names:
+            raise ValueError(
+                "Each tool or managed_agent should have a unique name! You passed these duplicate names: "
+                f"{conflicting_names}"
+            )
+
+        self.tools["activate_skill"] = ActivateSkillTool(self.skills)
+        self.tools["read_skill_resource"] = ReadSkillResourceTool(self.skills)
+
+    def _validate_tools_and_managed_agents(self, tools, managed_agents, skills=None):
         tool_and_managed_agent_names = [tool.name for tool in tools]
+        if skills:
+            tool_and_managed_agent_names += ["activate_skill", "read_skill_resource"]
         if managed_agents is not None:
             tool_and_managed_agent_names += [agent.name for agent in managed_agents]
         if self.name:
@@ -904,6 +936,9 @@ You have been provided with these additional arguments, that you can access dire
         Args:
             output_dir (`str` or `Path`): The folder in which you want to save your agent.
         """
+        if self.skills:
+            raise ValueError("Saving agents with skills is not supported yet.")
+
         make_init_file(output_dir)
 
         # Recursively save managed agents
@@ -973,6 +1008,9 @@ You have been provided with these additional arguments, that you can access dire
         Returns:
             `dict`: Dictionary representation of the agent.
         """
+        if self.skills:
+            raise ValueError("Serializing agents with skills is not supported yet.")
+
         # TODO: handle serializing step_callbacks and final_answer_checks
         for attr in ["final_answer_checks", "step_callbacks"]:
             if getattr(self, attr, None):
@@ -1267,6 +1305,7 @@ class ToolCallingAgent(MultiStepAgent):
             self.prompt_templates["system_prompt"],
             variables={
                 "tools": self.tools,
+                "skills": self.skills,
                 "managed_agents": self.managed_agents,
                 "custom_instructions": self.instructions,
             },
@@ -1623,6 +1662,7 @@ class CodeAgent(MultiStepAgent):
             self.prompt_templates["system_prompt"],
             variables={
                 "tools": self.tools,
+                "skills": self.skills,
                 "managed_agents": self.managed_agents,
                 "authorized_imports": (
                     "You can import from any package you want."
